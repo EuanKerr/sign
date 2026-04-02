@@ -50,10 +50,55 @@ stages:
             searchFolder: $(System.DefaultWorkingDirectory)
             testRunTitle: sign unit tests - $(Agent.JobName)
           condition: succeededOrFailed()
-        - task: PublishBuildArtifacts@1
-          displayName: 'Publish log files on failure'
-          inputs:
-            PathtoPublish: '$(Build.SourcesDirectory)/artifacts/log/$(_BuildConfig)'
-            ArtifactName: 'Logs'
-            publishLocation: 'Container'
-          condition: failed()
+        - template: /eng/common/templates/steps/publish-build-artifacts.yml
+          parameters:
+            displayName: 'Publish NuGet package'
+            pathToPublish: '$(Build.SourcesDirectory)/artifacts/packages/$(_BuildConfig)/Shipping'
+            artifactName: 'Packages'
+            condition: succeeded()
+        - template: /eng/common/templates/steps/publish-build-artifacts.yml
+          parameters:
+            displayName: 'Publish log files on failure'
+            pathToPublish: '$(Build.SourcesDirectory)/artifacts/log/$(_BuildConfig)'
+            artifactName: 'Logs'
+            condition: failed()
+
+- stage: Validate_Linux_Restore
+  displayName: Validate tool restore (Linux)
+  dependsOn: Build_Windows
+  jobs:
+  - job: Linux
+    pool:
+      name: NetCore-Public
+      demands: ImageOverride -equals build.azurelinux.3.amd64.open
+    steps:
+    - checkout: none
+    - task: DownloadBuildArtifacts@1
+      displayName: 'Download NuGet package'
+      inputs:
+        buildType: 'current'
+        downloadType: 'single'
+        artifactName: 'Packages'
+        downloadPath: '$(System.DefaultWorkingDirectory)'
+    - script: |
+        set -euo pipefail
+        NUPKG="$(find "$(System.DefaultWorkingDirectory)/Packages" -name '*.nupkg' -print -quit)"
+        if [ ! -f "$NUPKG" ]; then
+            echo "ERROR: No .nupkg found in Packages artifact"
+            exit 1
+        fi
+        NUPKG="$(realpath "$NUPKG")"
+        WORKDIR="$(mktemp -d)"
+        trap 'rm -rf "$WORKDIR"' EXIT
+        FEED_DIR="$WORKDIR/feed"
+        mkdir -p "$FEED_DIR"
+        cp "$NUPKG" "$FEED_DIR/"
+        NUSPEC="$(unzip -p "$NUPKG" '*.nuspec')"
+        PACKAGE_ID="$(echo "$NUSPEC" | sed -n 's/.*<id>\([^<]*\)<\/id>.*/\1/p' | head -1)"
+        PACKAGE_VERSION="$(echo "$NUSPEC" | sed -n 's/.*<version>\([^<]*\)<\/version>.*/\1/p' | head -1)"
+        echo "Validating restore: $PACKAGE_ID @ $PACKAGE_VERSION"
+        cd "$WORKDIR"
+        dotnet new tool-manifest
+        dotnet tool install "$PACKAGE_ID" --version "$PACKAGE_VERSION" --add-source "$FEED_DIR"
+        dotnet tool restore --verbosity detailed
+      displayName: 'Validate dotnet tool restore on Linux'
